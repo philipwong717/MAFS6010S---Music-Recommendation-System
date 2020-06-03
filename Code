@@ -1,0 +1,196 @@
+#Load library
+library(pROC) #to calculate the auc
+library(lightgbm) #to fit the model and do prediciton
+
+#Load data
+members=read.csv("members.csv")
+songs=read.csv("songs.csv")
+song.extra=read.csv("song_extra_info.csv")
+test=read.csv("test.csv")
+train=read.csv("train.csv")
+sample=read.csv("sample_submission.csv")
+
+#View data
+summary(members)
+summary(songs)
+summary(song.extra)
+summary(test)
+summary(train)
+summary(sample)
+
+#Convert registration_init_time and expiration_date records into proper number format 
+members<- transform(members, registration_init_time = as.Date(as.character(registration_init_time), "%Y%m%d"))
+members<- transform(members, expiration_date = as.Date(as.character(expiration_date), "%Y%m%d"))
+members<- transform(members, registration_init_time = as.numeric(registration_init_time-as.date("2000-01-01")))
+members<- transform(members, expiration_date = as.numeric(expiration_date-as.date("2000-01-01")))
+
+#Convert numerical data into categorical data
+songs$language<-as.factor(songs$language)
+members$city<-as.factor(members$city)
+members$registered_via<-as.factor(members$registered_via)
+
+#Merge Data
+train.merge<-merge(train,songs,by.x="song_id",by.y="song_id",all.x=TRUE)
+train.merge<-merge(train.merge,members,by.x="msno",by.y="msno",all.x=TRUE)
+
+#Remove data with unreasonable age or expiration_date
+train.merge<-train.merge[!(train.merge$expiration_date<train.merge$registration_init_time),]
+train.merge<-train.merge[!(train.merge$bd<0),]
+train.merge<-train.merge[!(train.merge$bd>100),]
+
+#Create Function for Cross Validation
+cross_validation <- function(nfold,depth,iterations){
+ 
+ error_rate<-array(nfold)
+ auc_score<-array(nfold)
+ set.seed(5)
+ sample<-sample.int(n=nrow(train.merge),size=nrow(train.merge),replace=F)
+
+ #Create n equally size folds
+ folds<-cut(sample,breaks=nfold,labels=FALSE)
+
+ #Preform n-fold cross validation
+ for (i in 1:nfold){
+   test_index<-which(folds==i,arr.ind=TRUE)
+   train.split<-train.merge[-test_index,]
+   test.split<-train.merge[test_index,]
+
+   #Convert the data into matrix for lightgbm input
+   train_data<-data.matrix(train.split[,-6])
+   label<-train.split$target
+   test_data<-data.matrix(test.split[,-6])
+   ts_label<-test.split$target
+
+   #Create LGBM dataset
+   dtrain<-lgb.Dataset(data = train_data, label=label, categorical_feature=c(1:3,5,6,8,9))
+   dtest<-lgb.Dataset.create.valid(dtrain,test_data,label=ts_label)
+
+   #Set parameter for LGBM
+   param <- list(
+    num_leaves = 256L
+    , max_depth = depth
+    , num_iterations = iterations
+    , learning_rate = 0.1
+    , boosting_type = "gbdt"
+    , objective = "binary"
+    , num_threads = 4L
+   )
+
+   #Fit the model
+   model <- lgb.train(param, dtrain)
+
+   #Evaluate the testing error and AUC score 
+   ptest <- predict(model,test_data)
+   result=rep(0,nrow(test.split))
+   result[ptest>0.5]=1
+   error_rate[i]=1-mean(ts_label==result)
+   auc_score[i]=auc(result,ts_label)
+   }
+ 
+ #Calculate the cross validation result
+ avg_error_rate=mean(error_rate)
+ avg_auc_score=mean(auc_score)
+ print(paste("average error rate is",avg_error_rate))
+ print(paste("average auc is",avg_auc_score))
+}
+
+#Perform 5-fold cross validation with different depth and iterations combination 
+cross_validation(5,2,100)
+cross_validation(5,2,300)
+cross_validation(5,2,600)
+cross_validation(5,5,100)
+cross_validation(5,5,300)
+cross_validation(5,5,600)
+cross_validation(5,8,100)
+cross_validation(5,8,300)
+cross_validation(5,8,600)
+cross_validation(5,11,100)
+cross_validation(5,11,300)
+cross_validation(5,11,600)
+cross_validation(5,11,1000)
+
+#Fit the model with full data and evaluate importances of feature
+#Convert the data into matrix for lightgbm input
+train_data<-data.matrix(train.merge[,-6])
+label<-train.merge$target
+
+#Create LGBM dataset
+dtrain<-lgb.Dataset(data = train_data, label=label, categorical_feature=c(1:3,5,6,8,9))
+
+#Set parameter for LGBM
+param <- list(
+    num_leaves = 256L
+    , max_depth = 11
+    , num_iterations = 1000
+    , learning_rate = 0.1
+    , boosting_type = "gbdt"
+    , objective = "binary"
+    , num_threads = 4L
+    )
+
+#Fit the model
+model <- lgb.train(param, dtrain)
+
+#Evaluate the importances of feature
+tree_imp <- lgb.importance(model, percentage = TRUE)
+lgb.plot.importance(tree_imp, top_n = 17L, measure = "Gain")
+
+#Create Function for Cross Validation_using top 10 features
+cross_validation_top10 <- function(nfold,depth,iterations){
+ 
+ error_rate<-array(nfold)
+ auc_score<-array(nfold)
+ set.seed(5)
+ train.merge.new<-subset(train.merge,select=c(target,msno,source_type,artist_name,song_length,song_id,expiration_date,source_system_tab,source_screen_name,registration_init_time,composer))
+ sample<-sample.int(n=nrow(train.merge.new),size=nrow(train.merge.new),replace=F)
+
+ #Create n equally size folds
+ folds<-cut(sample,breaks=nfold,labels=FALSE)
+
+ #Preform n-fold cross validation
+ for (i in 1:nfold){
+   test_index<-which(folds==i,arr.ind=TRUE)
+   train.split<-train.merge.new[-test_index,]
+   test.split<-train.merge.new[test_index,]
+
+   #Convert the data into matrix for lightgbm input
+   train_data<-data.matrix(train.split[,-1])
+   label<-train.split$target
+   test_data<-data.matrix(test.split[,-1])
+   ts_label<-test.split$target
+
+   #Create LGBM dataset
+   dtrain<-lgb.Dataset(data = train_data, label=label, categorical_feature=c(1:3,5,7,8,10))
+   dtest<-lgb.Dataset.create.valid(dtrain,test_data,label=ts_label)
+
+   #Set parameter for LGBM
+   param <- list(
+    num_leaves = 256L
+    , max_depth = depth
+    , num_iterations = iterations
+    , learning_rate = 0.1
+    , boosting_type = "gbdt"
+    , objective = "binary"
+    , num_threads = 4L
+   )
+
+   #Fit the model
+   model <- lgb.train(param, dtrain)
+
+   #Evaluate the testing error and AUC score 
+   ptest <- predict(model,test_data)
+   result=rep(0,nrow(test.split))
+   result[ptest>0.5]=1
+   error_rate[i]=1-mean(ts_label==result)
+   auc_score[i]=auc(result,ts_label)
+   }
+ 
+ #Calculate the cross validation result
+ avg_error_rate=mean(error_rate)
+ avg_auc_score=mean(auc_score)
+ print(paste("average error rate is",avg_error_rate))
+ print(paste("average auc is",avg_auc_score))
+}
+
+#Perform 5-fold cross validation using top 10 features
+cross_validation_top10(5,11,600)
